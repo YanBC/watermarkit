@@ -1,5 +1,5 @@
 ## TODO
-1. opencv poisson blending
+<del>1. opencv poisson blending</dev>
 2. web UI
 3. docker runtime env
 4. Chinese font
