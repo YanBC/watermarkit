@@ -6,12 +6,12 @@ from typing import List, Tuple
 
 FONT = cv.FONT_HERSHEY_SIMPLEX
 
-# Defaults, all relative to the text cap height so they scale with the image.
+# Defaults; everything else is derived from the text cap height.
 SIZE = 0.035        # cap height as a fraction of the image's shorter side
-GAP_X = 3.0         # horizontal gap between copies, in cap heights
-GAP_Y = 3.0         # vertical gap between rows, in cap heights
+MAX_WIDTH = 0.8     # text is shrunk (to at most half size) if one copy would be wider than this fraction of the image
+COVERAGE = 0.045    # gaps are chosen so text ink fills about this fraction of the image
 HALO = 0.15         # light outline width, in cap heights
-STRENGTH = 0.35     # 0..1, how far the text is pushed from the local image
+STRENGTH = 0.25     # 0..1, how far the text is pushed from the local image
 
 
 def get_args():
@@ -24,7 +24,8 @@ def get_args():
     p.add_argument("--size", type=float, default=SIZE,
                    help=f"text cap height as a fraction of the shorter image side (default {SIZE})")
     p.add_argument("--spacing", type=float, default=1.0,
-                   help="multiplier on the gaps between copies (default 1.0)")
+                   help=f"multiplier on the gaps between copies, which by default are sized so the text "
+                        f"covers about {COVERAGE:.1%} of the image (default 1.0)")
     p.add_argument("--strength", type=float, default=STRENGTH,
                    help=f"watermark strength / opacity, 0..1 (default {STRENGTH})")
     p.add_argument("--font", default=None,
@@ -112,7 +113,7 @@ def _fft_friendly(n):
         m += 1
 
 
-def tile_positions(image_shape, tile_shape, cap_h, spacing=1.0) -> List[Tuple[int, int]]:
+def tile_positions(image_shape, tile_shape, gap) -> List[Tuple[int, int]]:
     """Top-left corners of every tile that touches the image.
 
     Rows are staggered by half a cell and the pattern is centred on the image,
@@ -121,8 +122,8 @@ def tile_positions(image_shape, tile_shape, cap_h, spacing=1.0) -> List[Tuple[in
     """
     image_h, image_w = image_shape[:2]
     tile_h, tile_w = tile_shape
-    cell_w = tile_w + max(2, round(GAP_X * cap_h * spacing))
-    cell_h = tile_h + max(2, round(GAP_Y * cap_h * spacing))
+    cell_w = tile_w + max(2, gap)
+    cell_h = tile_h + max(2, gap)
     positions = []
     rows = image_h // (2 * cell_h) + 2
     cols = image_w // (2 * cell_w) + 2
@@ -232,14 +233,37 @@ def poisson_blend_mixed(dst, guide, rects):
     return out
 
 
-def watermarkit_seamless_clone(image, text, size=SIZE, spacing=1.0, strength=STRENGTH, font_path=None):
-    cap_h = max(6, round(size * min(image.shape[:2])))
+def layout(image_shape, text, size=SIZE, spacing=1.0, font_path=None):
+    """Render the tile at a size suited to the image and place its copies.
+
+    The cap height is size * the shorter image side, reduced if one copy would
+    be wider than MAX_WIDTH of the image, but never below half; very long text
+    then runs past the edges rather than becoming unreadably small. The gap between copies (the same in
+    both directions) is solved so the text ink covers COVERAGE of each grid cell,
+    then scaled by spacing; this keeps density the same for short and long text.
+    Returns (core, ring, positions).
+    """
+    image_h, image_w = image_shape[:2]
+    cap_h = max(6, round(size * min(image_h, image_w)))
     core, ring = render_tile(text, cap_h, font_path)
+    if core.shape[1] > MAX_WIDTH * image_w:
+        cap_h = max(6, int(cap_h * max(0.5, MAX_WIDTH * image_w / core.shape[1])))
+        core, ring = render_tile(text, cap_h, font_path)
+
+    # (tile_w + gap) * (tile_h + gap) = ink / COVERAGE
+    tile_h, tile_w = core.shape
+    total = tile_w + tile_h
+    gap = (np.sqrt(total ** 2 - 4 * (tile_w * tile_h - core.sum() / COVERAGE)) - total) / 2
+    positions = tile_positions(image_shape, core.shape, round(gap * spacing))
+    return core, ring, positions
+
+
+def watermarkit_seamless_clone(image, text, size=SIZE, spacing=1.0, strength=STRENGTH, font_path=None):
+    core, ring, positions = layout(image.shape, text, size, spacing, font_path)
     # Dark text with a light outline: the fill reads on light areas, the outline
     # on dark ones, and on busy texture the outline separates the glyph from it.
     guide = 255 * strength * (ring - core)
 
-    positions = tile_positions(image.shape, core.shape, cap_h, spacing)
     windows, rects = _extract_windows(image, core.shape, positions)
     blended = poisson_blend_mixed(windows, guide, rects)
 
@@ -253,12 +277,11 @@ def watermarkit_seamless_clone(image, text, size=SIZE, spacing=1.0, strength=STR
 def watermarkit_put_text(image, text, size=SIZE, spacing=1.0, strength=STRENGTH, font_path=None,
                          color=(40, 40, 40), outline_color=(236, 236, 238)):
     """Flat alternative: alpha-blend dark text with a light outline, same layout."""
-    cap_h = max(6, round(size * min(image.shape[:2])))
-    core, ring = render_tile(text, cap_h, font_path)
+    core, ring, positions = layout(image.shape, text, size, spacing, font_path)
     alpha = min(1.0, 2 * strength)
     tile_h, tile_w = core.shape
     canvas = image.astype(np.float32)
-    for x, y in tile_positions(image.shape, core.shape, cap_h, spacing):
+    for x, y in positions:
         y0, y1 = max(y, 0), min(y + tile_h, image.shape[0])
         x0, x1 = max(x, 0), min(x + tile_w, image.shape[1])
         c = alpha * core[y0 - y:y1 - y, x0 - x:x1 - x, None]

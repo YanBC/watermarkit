@@ -10,7 +10,7 @@ A single-file Python CLI (`watermarkit.py`) that tiles a text watermark across a
 
 ```bash
 pip install -r requirements.txt          # opencv-python (pulls in numpy)
-python watermarkit.py <image_path> "<text>" [--des out.jpg] [--size 0.035] [--spacing 1.0] [--strength 0.35] [--mode seamless|flat] [--font font.ttf] [--show]
+python watermarkit.py <image_path> "<text>" [--des out.jpg] [--size 0.035] [--spacing 1.0] [--strength 0.25] [--mode seamless|flat] [--font font.ttf] [--show]
 python watermarkit.py imgs/demo_id.jpg "FOR VERIFICATION ONLY"   # sample images in imgs/
 ```
 
@@ -18,7 +18,7 @@ python watermarkit.py imgs/demo_id.jpg "FOR VERIFICATION ONLY"   # sample images
 
 ## Architecture
 
-Everything scales with the text cap height, `cap_h = SIZE * min(image_h, image_w)`; the module-level defaults (`SIZE`, `GAP_X`, `GAP_Y`, `HALO`, `STRENGTH`) are in cap-height units.
+Module-level defaults: `SIZE`, `MAX_WIDTH`, `COVERAGE`, `HALO` (in cap heights) and `STRENGTH`. `layout` picks the size and spacing: `cap_h = SIZE * min(image_h, image_w)`, shrunk (to at most half) if one copy is wider than `MAX_WIDTH` of the image; the gap between copies (equal in x and y) is solved so text ink fills `COVERAGE` of each grid cell, times `--spacing`. So density is the same for short and long text.
 
 - `render_tile` rasterises one underlined copy of the text into two float masks: `core` (the text) and `ring` (an outline `HALO` cap heights wide). The tile is the ink bounding box plus a 3px blank margin, grown so `tile_dim - 1` has only factors 2, 3, 5 (FFT-friendly for the solver).
 - `tile_positions` lays tiles on a grid centred on the image, odd rows shifted by half a cell, keeping every tile that touches the image (partial edge tiles included). Gaps are at least 2px so tile windows never overlap, which keeps every tile's blend independent.

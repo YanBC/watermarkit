@@ -6,7 +6,7 @@ python watermarkit.py imgs/demo_id.jpg "FOR VERIFICATION ONLY" --des out.jpg
 python watermarkit.py imgs/rem.jpg "僅供核實 SAMPLE" --font /path/to/cjk-font.ttc   # non-ASCII needs --font (and Pillow)
 ```
 
-Options: `--size` (cap height as a fraction of the shorter image side), `--spacing` (gap multiplier), `--strength` (0..1), `--mode seamless|flat`, `--font`, `--show` (preview window).
+Text size and spacing adapt to the image and the text length. Options: `--size` (cap height as a fraction of the shorter image side), `--spacing` (multiplier on the automatic gaps), `--strength` (0..1, default 0.25), `--mode seamless|flat`, `--font`, `--show` (preview window).
 
 ## TODO
 1. <del>opencv poisson blending</del>
