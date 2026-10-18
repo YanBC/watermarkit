@@ -1,11 +1,17 @@
 import argparse
 import cv2 as cv
 import numpy as np
-from typing import Tuple
+from typing import List, Tuple
 
 
-SCALE_FACTOR_H = 6
-SCALE_FACTOR_W = 3
+FONT = cv.FONT_HERSHEY_SIMPLEX
+
+# Defaults, all relative to the text cap height so they scale with the image.
+SIZE = 0.035        # cap height as a fraction of the image's shorter side
+GAP_X = 3.0         # horizontal gap between copies, in cap heights
+GAP_Y = 3.0         # vertical gap between rows, in cap heights
+HALO = 0.15         # light outline width, in cap heights
+STRENGTH = 0.35     # 0..1, how far the text is pushed from the local image
 
 
 def get_args():
@@ -13,113 +19,268 @@ def get_args():
     p.add_argument("image_path", help="Image to watermark")
     p.add_argument("text", help="Text to watermark with")
     p.add_argument("--des", help="Save image", default="watermarked.jpg")
+    p.add_argument("--mode", choices=["seamless", "flat"], default="seamless",
+                   help="seamless: Poisson-blend into the image texture (default); flat: plain alpha blend")
+    p.add_argument("--size", type=float, default=SIZE,
+                   help=f"text cap height as a fraction of the shorter image side (default {SIZE})")
+    p.add_argument("--spacing", type=float, default=1.0,
+                   help="multiplier on the gaps between copies (default 1.0)")
+    p.add_argument("--strength", type=float, default=STRENGTH,
+                   help=f"watermark strength / opacity, 0..1 (default {STRENGTH})")
+    p.add_argument("--font", default=None,
+                   help="TrueType/OpenType font file, needed for non-ASCII text such as Chinese (requires Pillow)")
+    p.add_argument("--show", action="store_true", help="preview the result in a window before saving")
     return p.parse_args()
 
 
-def write_text_at_centre(canvas, centre, text, thickness, font_scale, color):
-    centre_x, centre_y = centre
-    textSize, baseLine = cv.getTextSize(text, cv.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-    baseLine += thickness
-
-    text_origin_x = centre_x - textSize[0] // 2
-    text_origin_y = centre_y + textSize[1] // 2
-
-    line_origin_x = text_origin_x
-    line_origin_y = text_origin_y + 2 * thickness
-    line_end_x = text_origin_x + textSize[0]
-    line_end_y = line_origin_y
-
-    cv.line(canvas, (line_origin_x, line_origin_y), (line_end_x, line_end_y), color, thickness)
-    cv.putText(canvas, text, (text_origin_x, text_origin_y), cv.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness)
-    return canvas
+def _render_hershey(text, cap_h, thickness, halo, margin):
+    scale = cap_h / cv.getTextSize(text, FONT, 1.0, thickness)[0][1]
+    (text_w, text_h), _ = cv.getTextSize(text, FONT, scale, thickness)
+    under_y = margin + text_h + 2 * thickness
+    shape = (under_y + thickness + margin, text_w + 2 * margin)
+    core = np.zeros(shape, np.uint8)
+    outline = np.zeros(shape, np.uint8)
+    for canvas, extra in ((core, 0), (outline, 2 * halo)):
+        org = (margin, margin + text_h)
+        cv.putText(canvas, text, org, FONT, scale, 255, thickness + extra, cv.LINE_AA)
+        cv.line(canvas, (margin, under_y), (margin + text_w, under_y), 255, thickness + extra, cv.LINE_AA)
+    return core, outline
 
 
-def generate_watermark_gray(
-            text, thickness, font_scale) -> Tuple[np.ndarray, np.ndarray]:
-    global SCALE_FACTOR_H, SCALE_FACTOR_W
-    assert SCALE_FACTOR_H > 1 and SCALE_FACTOR_W > 1
-    textSize, _ = cv.getTextSize(text, cv.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-    textSize_w, textSize_h = textSize
-    bg_w = textSize_w * SCALE_FACTOR_W
-    bg_h = textSize_h * SCALE_FACTOR_H
-    background = np.zeros((bg_h, bg_w), dtype=np.uint8)
-    background = write_text_at_centre(background, (bg_w//2, bg_h//2), text=text, thickness=thickness, font_scale=font_scale, color=255)
-    roi = np.zeros_like(background)
-    roi_left = (bg_w - textSize_w) // 2 - 1
-    roi_right = (bg_w + textSize_w) // 2 + 1
-    roi_top = (bg_h - textSize_h) // 2 - 1
-    roi_bottom = (bg_h + textSize_h) // 2 + 1
-    roi[roi_top:roi_bottom, roi_left:roi_right] = 255
-    return background, roi
+def _render_truetype(text, cap_h, thickness, halo, margin, font_path):
+    from PIL import Image, ImageDraw, ImageFont
+    probe = ImageFont.truetype(font_path, 100)
+    l, t, r, b = probe.getbbox("H")
+    font = ImageFont.truetype(font_path, max(1, round(100 * cap_h / (b - t))))
+    l, t, r, b = font.getbbox(text, anchor="ls")
+    under_y = 2 * thickness
+    bottom = max(b, under_y + thickness)
+    size = (r - l + 2 * margin, bottom - t + 2 * margin)
+    org = (margin - l, margin - t)
+    line = (margin, org[1] + under_y, margin + r - l, org[1] + under_y + thickness - 1)
+    masks = []
+    for extra in (0, halo):
+        img = Image.new("L", size, 0)
+        draw = ImageDraw.Draw(img)
+        draw.text(org, text, fill=255, font=font, anchor="ls", stroke_width=extra, stroke_fill=255)
+        draw.rectangle((line[0] - extra, line[1] - extra, line[2] + extra, line[3] + extra), fill=255)
+        masks.append(np.asarray(img))
+    return masks[0], masks[1]
 
 
-def watermarkit_put_text(image, text,
-              thickness=1, font_scale=0.5, color=(236, 236, 238)):
-    global SCALE_FACTOR_H, SCALE_FACTOR_W
+def render_tile(text, cap_h, font_path=None) -> Tuple[np.ndarray, np.ndarray]:
+    """Rasterise one underlined copy of the text.
+
+    Returns (core, ring) as float32 in [0, 1]: core is the text, ring the outline
+    around it. The tile is cropped to the ink plus a blank margin, so the blend
+    region (the tile minus its 1px border) covers every stroke with room to spare.
+    """
+    thickness = max(1, round(cap_h / 12))
+    halo = max(1, round(cap_h * HALO))
+    margin = halo + thickness + 4
+    if font_path:
+        core, outline = _render_truetype(text, cap_h, thickness, halo, margin, font_path)
+    else:
+        if not text.isascii():
+            raise ValueError("Hershey fonts are ASCII-only, pass --font for non-ASCII text")
+        core, outline = _render_hershey(text, cap_h, thickness, halo, margin)
+    core = core.astype(np.float32) / 255
+    outline = outline.astype(np.float32) / 255
+    ring = np.maximum(outline - core, 0)
+
+    ys, xs = np.nonzero(outline)
+    pad = 3
+    y0, x0 = ys.min() - pad, xs.min() - pad
+    # Grow the tile so the solver's FFT length, 2 * (size - 1), factors into 2, 3, 5.
+    h = _fft_friendly(ys.max() + pad + 1 - y0)
+    w = _fft_friendly(xs.max() + pad + 1 - x0)
+    core = np.pad(core, ((pad, h), (pad, w)))[y0 + pad:y0 + pad + h, x0 + pad:x0 + pad + w]
+    ring = np.pad(ring, ((pad, h), (pad, w)))[y0 + pad:y0 + pad + h, x0 + pad:x0 + pad + w]
+    return core, ring
+
+
+def _fft_friendly(n):
+    """Smallest m >= n such that m - 1 has no prime factor above 5."""
+    m = n
+    while True:
+        r = m - 1
+        for p in (2, 3, 5):
+            while r % p == 0:
+                r //= p
+        if r == 1:
+            return m
+        m += 1
+
+
+def tile_positions(image_shape, tile_shape, cap_h, spacing=1.0) -> List[Tuple[int, int]]:
+    """Top-left corners of every tile that touches the image.
+
+    Rows are staggered by half a cell and the pattern is centred on the image,
+    so partial tiles at the edges are included. Gaps are kept wide enough that
+    tiles never overlap, which lets every tile be blended independently.
+    """
+    image_h, image_w = image_shape[:2]
+    tile_h, tile_w = tile_shape
+    cell_w = tile_w + max(2, round(GAP_X * cap_h * spacing))
+    cell_h = tile_h + max(2, round(GAP_Y * cap_h * spacing))
+    positions = []
+    rows = image_h // (2 * cell_h) + 2
+    cols = image_w // (2 * cell_w) + 2
+    for j in range(-rows, rows + 1):
+        cy = image_h / 2 + j * cell_h
+        for i in range(-cols, cols + 1):
+            cx = image_w / 2 + (i + 0.5 * (j % 2)) * cell_w
+            x, y = round(cx - tile_w / 2), round(cy - tile_h / 2)
+            if x + tile_w > 1 and y + tile_h > 1 and x < image_w - 1 and y < image_h - 1:
+                positions.append((x, y))
+    return positions
+
+
+def _extract_windows(image, tile_shape, positions):
+    """Copy each tile's window out of the image, plus the rectangle to blend in it.
+
+    Window pixels outside the image are left at 0 and never blended. The blend
+    rectangle is the window minus its 1px border, clipped so the image's own 1px
+    border stays fixed; every blended pixel then has 4 in-image neighbours and
+    the pixels around the rectangle are its (Dirichlet) boundary.
+    """
+    image_h, image_w = image.shape[:2]
+    tile_h, tile_w = tile_shape
+    windows = np.zeros((len(positions), tile_h, tile_w, image.shape[2]), np.float32)
+    rects = []
+    for k, (x, y) in enumerate(positions):
+        x0, y0, x1, y1 = max(x, 0), max(y, 0), min(x + tile_w, image_w), min(y + tile_h, image_h)
+        windows[k, y0 - y:y1 - y, x0 - x:x1 - x] = image[y0:y1, x0:x1]
+        x0, y0 = max(x + 1, 1), max(y + 1, 1)
+        x1, y1 = min(x + tile_w - 1, image_w - 1), min(y + tile_h - 1, image_h - 1)
+        rects.append((y0 - y, y1 - y, x0 - x, x1 - x))
+    return windows, rects
+
+
+def _dst(a):
+    """Type-I discrete sine transform over the last axis, via a real FFT.
+
+    Applying it twice scales the input by (n + 1) / 2.
+    """
+    n = a.shape[-1]
+    zero = np.zeros(a.shape[:-1] + (1,), a.dtype)
+    odd = np.concatenate([zero, a, zero, -a[..., ::-1]], axis=-1)
+    return -np.fft.rfft(odd, axis=-1).imag[..., 1:n + 1].astype(a.dtype) / 2
+
+
+def _solve_poisson_rect(b):
+    """Solve 4x - (sum of 4 neighbours) = b on rectangles, with x = 0 outside.
+
+    b: (..., h, w). The 5-point Laplacian is diagonal in the DST-I basis, so this
+    is an exact solve in O(hw log hw).
+    """
+    h, w = b.shape[-2:]
+    lam_y = 2 - 2 * np.cos(np.pi * np.arange(1, h + 1) / (h + 1))
+    lam_x = 2 - 2 * np.cos(np.pi * np.arange(1, w + 1) / (w + 1))
+    t = _dst(_dst(b).swapaxes(-1, -2)).swapaxes(-1, -2)
+    t /= (lam_y[:, None] + lam_x[None, :]).astype(b.dtype)
+    x = _dst(_dst(t).swapaxes(-1, -2)).swapaxes(-1, -2)
+    return x * np.float32(4 / ((h + 1) * (w + 1)))
+
+
+def poisson_blend_mixed(dst, guide, rects):
+    """Mixed-gradient Poisson blend of a guidance potential into image windows.
+
+    dst: (n, h, w, c) float image windows, which also supply the boundary values.
+    guide: (h, w) potential whose gradients carry the watermark, shared by every
+    window, or (n, h, w) for one per window.
+    rects: per window, the (y0, y1, x0, x1) rectangle to solve for; it must not
+    touch the window border.
+
+    For every pixel pair (p, q) the target difference f_p - f_q is the guide's
+    difference if its magnitude beats the image's (summed over channels), else
+    the image's. Returns the windows with each rectangle replaced by the solution.
+    """
+    channels = dst.shape[3]
+    s = np.broadcast_to(guide, dst.shape[:3])[..., None]
+
+    def mixed(sd, dd):
+        return np.where(sd * sd * channels > np.sum(dd * dd, axis=3, keepdims=True), sd, dd)
+
+    vx = mixed(s[:, :, :-1] - s[:, :, 1:], dst[:, :, :-1] - dst[:, :, 1:])
+    vy = mixed(s[:, :-1] - s[:, 1:], dst[:, :-1] - dst[:, 1:])
+    div = np.zeros_like(dst)
+    div[:, :, :-1] += vx
+    div[:, :, 1:] -= vx
+    div[:, :-1] += vy
+    div[:, 1:] -= vy
+
+    out = dst.copy()
+    groups = {}
+    for k, (y0, y1, x0, x1) in enumerate(rects):
+        if y1 > y0 and x1 > x0:
+            groups.setdefault((y1 - y0, x1 - x0), []).append(k)
+    for (h, w), ks in groups.items():
+        b = np.empty((len(ks), h, w, channels), np.float32)
+        for i, k in enumerate(ks):
+            y0, y1, x0, x1 = rects[k]
+            b[i] = div[k, y0:y1, x0:x1]
+            # Known pixels just outside the rectangle move to the right-hand side.
+            b[i, 0] += dst[k, y0 - 1, x0:x1]
+            b[i, -1] += dst[k, y1, x0:x1]
+            b[i, :, 0] += dst[k, y0:y1, x0 - 1]
+            b[i, :, -1] += dst[k, y0:y1, x1]
+        x = _solve_poisson_rect(b.transpose(0, 3, 1, 2)).transpose(0, 2, 3, 1)
+        for i, k in enumerate(ks):
+            y0, y1, x0, x1 = rects[k]
+            out[k, y0:y1, x0:x1] = x[i]
+    return out
+
+
+def watermarkit_seamless_clone(image, text, size=SIZE, spacing=1.0, strength=STRENGTH, font_path=None):
+    cap_h = max(6, round(size * min(image.shape[:2])))
+    core, ring = render_tile(text, cap_h, font_path)
+    # Dark text with a light outline: the fill reads on light areas, the outline
+    # on dark ones, and on busy texture the outline separates the glyph from it.
+    guide = 255 * strength * (ring - core)
+
+    positions = tile_positions(image.shape, core.shape, cap_h, spacing)
+    windows, rects = _extract_windows(image, core.shape, positions)
+    blended = poisson_blend_mixed(windows, guide, rects)
 
     canvas = image.copy()
-    image_h, image_w, _ = image.shape
-
-    textSize, _ = cv.getTextSize(text, cv.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-    textSize_w, textSize_h = textSize
-
-    gridSize_w = textSize_w * SCALE_FACTOR_W
-    gridSize_h = textSize_h * SCALE_FACTOR_H
-
-    num_x = image_w // gridSize_w + 1
-    num_y = image_h // gridSize_h + 1
-    print("grid size:", num_x, num_y)
-
-    for i in range(num_x):
-        for j in range(num_y):
-            grid_centre_x = int(gridSize_w / 2 + i * gridSize_w)
-            grid_centre_y = int(gridSize_h / 2 + j * gridSize_h)
-            canvas = write_text_at_centre(canvas, (grid_centre_x, grid_centre_y), text, thickness, font_scale, color)
-
+    for (x, y), (y0, y1, x0, x1), win in zip(positions, rects, blended):
+        if y1 > y0 and x1 > x0:
+            canvas[y + y0:y + y1, x + x0:x + x1] = np.clip(win[y0:y1, x0:x1] + 0.5, 0, 255)
     return canvas
 
 
-def watermarkit_seamless_clone(image, text,
-                             thickness=1, font_scale=0.5):
-    global SCALE_FACTOR_H, SCALE_FACTOR_W
-
-    canvas = image.copy()
-    image_h, image_w, _ = image.shape
-
-    textSize, _ = cv.getTextSize(text, cv.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-    textSize_w, textSize_h = textSize
-
-    gridSize_w = textSize_w * SCALE_FACTOR_W
-    gridSize_h = textSize_h * SCALE_FACTOR_H
-
-    num_x = image_w // gridSize_w
-    num_y = image_h // gridSize_h
-    print("grid size:", num_x, num_y)
-
-    watermark_gray, watermark_bool = generate_watermark_gray(text=text, thickness=thickness, font_scale=font_scale)
-    watermark_dim3 = np.stack([watermark_gray, watermark_gray, watermark_gray], axis=-1)
-
-    for i in range(num_x):
-        for j in range(num_y):
-            # print(i, j)
-            grid_centre_x = int(gridSize_w / 2 + i * gridSize_w)
-            grid_centre_y = int(gridSize_h / 2 + j * gridSize_h)
-            canvas = cv.seamlessClone(watermark_dim3, canvas, watermark_bool, (grid_centre_x, grid_centre_y), cv.MIXED_CLONE)
-
-    return canvas
+def watermarkit_put_text(image, text, size=SIZE, spacing=1.0, strength=STRENGTH, font_path=None,
+                         color=(40, 40, 40), outline_color=(236, 236, 238)):
+    """Flat alternative: alpha-blend dark text with a light outline, same layout."""
+    cap_h = max(6, round(size * min(image.shape[:2])))
+    core, ring = render_tile(text, cap_h, font_path)
+    alpha = min(1.0, 2 * strength)
+    tile_h, tile_w = core.shape
+    canvas = image.astype(np.float32)
+    for x, y in tile_positions(image.shape, core.shape, cap_h, spacing):
+        y0, y1 = max(y, 0), min(y + tile_h, image.shape[0])
+        x0, x1 = max(x, 0), min(x + tile_w, image.shape[1])
+        c = alpha * core[y0 - y:y1 - y, x0 - x:x1 - x, None]
+        o = alpha * ring[y0 - y:y1 - y, x0 - x:x1 - x, None]
+        roi = canvas[y0:y1, x0:x1]
+        roi[:] = roi * (1 - c - o) + np.float32(color) * c + np.float32(outline_color) * o
+    return np.clip(canvas + 0.5, 0, 255).astype(np.uint8)
 
 
 if __name__ == '__main__':
     args = get_args()
-    image_path = args.image_path
-    text = args.text
-    des = args.des
 
-    image = cv.imread(image_path)
+    image = cv.imread(args.image_path)
     assert image is not None, "Image not found"
-    watermarked = watermarkit_seamless_clone(image, text)
+    if not args.font and not args.text.isascii():
+        raise SystemExit("Hershey fonts are ASCII-only, pass --font for non-ASCII text")
+    watermark = watermarkit_seamless_clone if args.mode == "seamless" else watermarkit_put_text
+    watermarked = watermark(image, args.text, size=args.size, spacing=args.spacing,
+                            strength=args.strength, font_path=args.font)
 
-    cv.imshow("Watermarked", watermarked)
-    cv.waitKey()
-    cv.imwrite(des, watermarked)
-    print(f"saved to {des}")
+    if args.show:
+        cv.imshow("Watermarked", watermarked)
+        cv.waitKey()
+    cv.imwrite(args.des, watermarked)
+    print(f"saved to {args.des}")

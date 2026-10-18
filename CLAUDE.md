@@ -10,18 +10,19 @@ A single-file Python CLI (`watermarkit.py`) that tiles a text watermark across a
 
 ```bash
 pip install -r requirements.txt          # opencv-python (pulls in numpy)
-python watermarkit.py <image_path> "<text>" [--des out.jpg]
-python watermarkit.py imgs/demo_id.jpg "FOR VERIFICATION ONLY"   # sample image in imgs/
+python watermarkit.py <image_path> "<text>" [--des out.jpg] [--size 0.035] [--spacing 1.0] [--strength 0.35] [--mode seamless|flat] [--font font.ttf] [--show]
+python watermarkit.py imgs/demo_id.jpg "FOR VERIFICATION ONLY"   # sample images in imgs/
 ```
 
-The script calls `cv.imshow` + `cv.waitKey()` before saving, so it blocks until a key is pressed in the preview window and needs a display. For headless runs or scripted checks, import the functions instead of running `__main__`.
+`--show` previews with `cv.imshow` (needs a display); without it the script runs headless. `--font` renders with Pillow (only imported then) and is required for non-ASCII text such as Chinese; otherwise Hershey `FONT_HERSHEY_SIMPLEX` is used.
 
 ## Architecture
 
-Two watermarking strategies share the same tiling layout:
+Everything scales with the text cap height, `cap_h = SIZE * min(image_h, image_w)`; the module-level defaults (`SIZE`, `GAP_X`, `GAP_Y`, `HALO`, `STRENGTH`) are in cap-height units.
 
-- Text size comes from `cv.getTextSize` with `FONT_HERSHEY_SIMPLEX`; each grid cell is `text_w * SCALE_FACTOR_W` by `text_h * SCALE_FACTOR_H` (module-level globals, both must be > 1). One copy of the text, underlined, is drawn centred in each cell via `write_text_at_centre`.
-- `watermarkit_put_text`: draws text directly onto the image in a fixed light color. Uses `image_dim // grid + 1` cells, so tiles may run past the edges (clipped by OpenCV).
-- `watermarkit_seamless_clone` (the one `__main__` uses): renders one white-on-black tile plus a rectangular text mask with `generate_watermark_gray`, then Poisson-blends it into every cell with `cv.seamlessClone(..., cv.MIXED_CLONE)` so the watermark picks up the local image texture. The tile is exactly one grid cell in size, and `seamlessClone` fails if the patch extends past the destination, so this path uses `image_dim // grid` cells (floor, no `+1`). Keep that in mind when changing the grid math or scale factors.
+- `render_tile` rasterises one underlined copy of the text into two float masks: `core` (the text) and `ring` (an outline `HALO` cap heights wide). The tile is the ink bounding box plus a 3px blank margin, grown so `tile_dim - 1` has only factors 2, 3, 5 (FFT-friendly for the solver).
+- `tile_positions` lays tiles on a grid centred on the image, odd rows shifted by half a cell, keeping every tile that touches the image (partial edge tiles included). Gaps are at least 2px so tile windows never overlap, which keeps every tile's blend independent.
+- `watermarkit_seamless_clone` (default): the guide is `255 * strength * (ring - core)`, dark text with a light outline. `poisson_blend_mixed` solves, per tile, a Poisson equation over the tile rectangle minus its 1px border (clipped to the image interior), with the image as the Dirichlet boundary. For each pixel pair the target difference is the guide's if its magnitude beats the image's (summed over channels), else the image's (mixed gradients). The rectangle is solved exactly with a DST-I (`_solve_poisson_rect`, via `np.fft.rfft`), batched over tiles of the same rectangle size. It does not use `cv.seamlessClone`.
+- `watermarkit_put_text` (`--mode flat`): same tile and layout, plain alpha blend of dark text with a light outline.
 
-Planned work (from README TODO): web UI, Docker runtime, Chinese font support (Hershey fonts are ASCII-only), GPU-accelerated Poisson blending, and OCR to avoid overlapping existing text.
+Planned work (from README TODO): web UI (client-side, static hosting; the blend is meant to port to plain JS), Docker runtime, GPU-accelerated Poisson blending, and OCR to avoid overlapping existing text.
