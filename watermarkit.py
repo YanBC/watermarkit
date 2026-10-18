@@ -34,21 +34,17 @@ def get_args():
     return p.parse_args()
 
 
-def _render_hershey(text, cap_h, thickness, halo, margin):
+def _render_hershey(text, cap_h, thickness, margin):
     scale = cap_h / cv.getTextSize(text, FONT, 1.0, thickness)[0][1]
     (text_w, text_h), _ = cv.getTextSize(text, FONT, scale, thickness)
     under_y = margin + text_h + 2 * thickness
-    shape = (under_y + thickness + margin, text_w + 2 * margin)
-    core = np.zeros(shape, np.uint8)
-    outline = np.zeros(shape, np.uint8)
-    for canvas, extra in ((core, 0), (outline, 2 * halo)):
-        org = (margin, margin + text_h)
-        cv.putText(canvas, text, org, FONT, scale, 255, thickness + extra, cv.LINE_AA)
-        cv.line(canvas, (margin, under_y), (margin + text_w, under_y), 255, thickness + extra, cv.LINE_AA)
-    return core, outline
+    core = np.zeros((under_y + thickness + margin, text_w + 2 * margin), np.uint8)
+    cv.putText(core, text, (margin, margin + text_h), FONT, scale, 255, thickness, cv.LINE_AA)
+    cv.line(core, (margin, under_y), (margin + text_w, under_y), 255, thickness, cv.LINE_AA)
+    return core
 
 
-def _render_truetype(text, cap_h, thickness, halo, margin, font_path):
+def _render_truetype(text, cap_h, thickness, margin, font_path):
     from PIL import Image, ImageDraw, ImageFont
     probe = ImageFont.truetype(font_path, 100)
     l, t, r, b = probe.getbbox("H")
@@ -56,17 +52,12 @@ def _render_truetype(text, cap_h, thickness, halo, margin, font_path):
     l, t, r, b = font.getbbox(text, anchor="ls")
     under_y = 2 * thickness
     bottom = max(b, under_y + thickness)
-    size = (r - l + 2 * margin, bottom - t + 2 * margin)
+    img = Image.new("L", (r - l + 2 * margin, bottom - t + 2 * margin), 0)
     org = (margin - l, margin - t)
-    line = (margin, org[1] + under_y, margin + r - l, org[1] + under_y + thickness - 1)
-    masks = []
-    for extra in (0, halo):
-        img = Image.new("L", size, 0)
-        draw = ImageDraw.Draw(img)
-        draw.text(org, text, fill=255, font=font, anchor="ls", stroke_width=extra, stroke_fill=255)
-        draw.rectangle((line[0] - extra, line[1] - extra, line[2] + extra, line[3] + extra), fill=255)
-        masks.append(np.asarray(img))
-    return masks[0], masks[1]
+    draw = ImageDraw.Draw(img)
+    draw.text(org, text, fill=255, font=font, anchor="ls")
+    draw.rectangle((margin, org[1] + under_y, margin + r - l, org[1] + under_y + thickness - 1), fill=255)
+    return np.asarray(img)
 
 
 def render_tile(text, cap_h, font_path=None) -> Tuple[np.ndarray, np.ndarray]:
@@ -80,13 +71,16 @@ def render_tile(text, cap_h, font_path=None) -> Tuple[np.ndarray, np.ndarray]:
     halo = max(1, round(cap_h * HALO))
     margin = halo + thickness + 4
     if font_path:
-        core, outline = _render_truetype(text, cap_h, thickness, halo, margin, font_path)
+        core = _render_truetype(text, cap_h, thickness, margin, font_path)
     else:
         if not text.isascii():
             raise ValueError("Hershey fonts are ASCII-only, pass --font for non-ASCII text")
-        core, outline = _render_hershey(text, cap_h, thickness, halo, margin)
+        core = _render_hershey(text, cap_h, thickness, margin)
+    # The outline is the text grown by halo px. Dilating, rather than drawing a
+    # thicker stroke, works for any font: OpenCV 5's putText ignores thickness.
+    disk = cv.getStructuringElement(cv.MORPH_ELLIPSE, (2 * halo + 1, 2 * halo + 1))
+    outline = cv.dilate(core, disk).astype(np.float32) / 255
     core = core.astype(np.float32) / 255
-    outline = outline.astype(np.float32) / 255
     ring = np.maximum(outline - core, 0)
 
     ys, xs = np.nonzero(outline)
