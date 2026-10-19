@@ -4,21 +4,22 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>watermarkit</title>
-  <meta name="description" content="Tile a text watermark across an image, blended into its texture. Runs entirely in your browser.">
+  <meta name="description" content="Tile a text watermark across an image or PDF, blended into its texture. Runs entirely in your browser.">
   <link rel="stylesheet" href="style.css">
+  <script src="vendor/pdf-lib.min.js"></script>
   <script type="module" src="app.js"></script>
 </head>
 <body>
   <header>
     <h1>watermarkit</h1>
-    <p>Tile a text watermark that blends into the image. Your image never leaves this device.</p>
+    <p>Tile a text watermark that blends into the image. Your images and PDFs never leave this device.</p>
   </header>
 
   <main>
     <section class="controls" aria-label="Watermark settings">
       <label class="file">
-        <input id="file" type="file" accept="image/*">
-        <span>Choose image</span>
+        <input id="file" type="file" accept="image/*,application/pdf">
+        <span>Choose image or PDF</span>
       </label>
 
       <label class="field">
@@ -55,7 +56,7 @@
 
     <section class="stage" id="stage">
       <div class="empty" id="empty">
-        <p><strong>Drop an image here</strong>, paste one, or choose a file.</p>
+        <p><strong>Drop an image or PDF here</strong>, paste an image, or choose a file.</p>
       </div>
       <canvas id="view" hidden></canvas>
       <button id="compare" type="button" class="compare" hidden>Hold to compare</button>

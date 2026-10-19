@@ -1,4 +1,6 @@
 import argparse
+import os
+
 import cv2 as cv
 import numpy as np
 from typing import List, Tuple
@@ -12,15 +14,18 @@ MAX_WIDTH = 0.8     # text is shrunk (to at most half size) if one copy would be
 COVERAGE = 0.045    # gaps are chosen so text ink fills about this fraction of the image
 HALO = 0.15         # light outline width, in cap heights
 STRENGTH = 0.25     # 0..1, how far the text is pushed from the local image
+MAX_PDF_PIXELS = 24_000_000  # cap on a rasterised PDF page's area, ~6000 × 4000
 
 
 def get_args():
-    p = argparse.ArgumentParser(description="Watermark an image with a text")
-    p.add_argument("image_path", help="Image to watermark")
+    p = argparse.ArgumentParser(description="Watermark an image or PDF with a text")
+    p.add_argument("image_path", help="Image or PDF to watermark")
     p.add_argument("text", help="Text to watermark with")
-    p.add_argument("--des", help="Save image", default="watermarked.jpg")
+    p.add_argument("--des", help="Save output (default watermarked.jpg, or .pdf for PDF input)")
     p.add_argument("--mode", choices=["seamless", "flat"], default="seamless",
                    help="seamless: Poisson-blend into the image texture (default); flat: plain alpha blend")
+    p.add_argument("--dpi", type=int, default=150,
+                   help="resolution for rasterising PDF pages (default 150)")
     p.add_argument("--size", type=float, default=SIZE,
                    help=f"text cap height as a fraction of the shorter image side (default {SIZE})")
     p.add_argument("--spacing", type=float, default=1.0,
@@ -285,19 +290,79 @@ def watermarkit_put_text(image, text, size=SIZE, spacing=1.0, strength=STRENGTH,
     return np.clip(canvas + 0.5, 0, 255).astype(np.uint8)
 
 
+def watermark_pdf_file(pdf_path, text, mode="seamless", size=SIZE, spacing=1.0,
+                       strength=STRENGTH, font_path=None, dpi=150, des="watermarked.pdf", show=False):
+    """Watermark every page of a PDF and save it as a new PDF.
+
+    Each page is rasterised with pdfium, watermarked with the same pipeline as
+    an image, and the pages are re-assembled into a PDF by Pillow. Page content
+    becomes an image, so the original text is no longer selectable. If even the
+    largest page would exceed MAX_PDF_PIXELS, the whole document is rasterised
+    at a lower dpi: Pillow sizes every page from one shared resolution.
+    """
+    try:
+        import pypdfium2 as pdfium
+        from PIL import Image
+    except ImportError:
+        raise SystemExit("PDF support needs pypdfium2 and Pillow: pip install -r requirements.txt")
+
+    watermark = watermarkit_seamless_clone if mode == "seamless" else watermarkit_put_text
+    try:
+        pdf = pdfium.PdfDocument(pdf_path)
+    except pdfium.PdfiumError:
+        raise SystemExit("Could not read this PDF (is it password-protected?)")
+    try:
+        # Filled-in form values are only drawn if the form is initialised.
+        if pdf.get_formtype() is not None:
+            pdf.init_forms()
+        if len(pdf) == 0:
+            raise SystemExit("PDF has no pages")
+        scale = dpi / 72
+        largest = max(w * h for w, h in (page.get_size() for page in pdf))
+        if largest * scale ** 2 > MAX_PDF_PIXELS:
+            scale = (MAX_PDF_PIXELS / largest) ** 0.5
+            print(f"reduced rasterisation to {round(72 * scale)} dpi to bound memory")
+        pages = []
+        for page in pdf:
+            # pdfium's native buffer is BGR, ready for OpenCV.
+            image = page.render(scale=scale, may_draw_forms=True).to_numpy()[..., :3]
+            watermarked = watermark(image, text, size=size, spacing=spacing,
+                                    strength=strength, font_path=font_path)
+            pages.append(Image.fromarray(cv.cvtColor(watermarked, cv.COLOR_BGR2RGB)))
+            if show and len(pages) == 1:
+                cv.imshow("Watermarked (page 1)", watermarked)
+    finally:
+        pdf.close()
+    if show:
+        cv.waitKey()
+    pages[0].save(des, save_all=True, append_images=pages[1:], resolution=72 * scale, quality=92)
+    return len(pages)
+
+
 if __name__ == '__main__':
     args = get_args()
-
-    image = cv.imread(args.image_path)
-    assert image is not None, "Image not found"
     if not args.font and not args.text.isascii():
         raise SystemExit("Hershey fonts are ASCII-only, pass --font for non-ASCII text")
-    watermark = watermarkit_seamless_clone if args.mode == "seamless" else watermarkit_put_text
-    watermarked = watermark(image, args.text, size=args.size, spacing=args.spacing,
-                            strength=args.strength, font_path=args.font)
 
-    if args.show:
-        cv.imshow("Watermarked", watermarked)
-        cv.waitKey()
-    cv.imwrite(args.des, watermarked)
-    print(f"saved to {args.des}")
+    if args.image_path.lower().endswith(".pdf"):
+        des = args.des or "watermarked.pdf"
+        if not des.lower().endswith(".pdf"):
+            des = os.path.splitext(des)[0] + ".pdf"
+            print(f"note: PDF input produces PDF output; saving to {des}")
+        n = watermark_pdf_file(args.image_path, args.text, mode=args.mode, size=args.size,
+                               spacing=args.spacing, strength=args.strength, font_path=args.font,
+                               dpi=args.dpi, des=des, show=args.show)
+        print(f"saved {n} page{'s' if n != 1 else ''} to {des}")
+    else:
+        image = cv.imread(args.image_path)
+        assert image is not None, "Image not found"
+        watermark = watermarkit_seamless_clone if args.mode == "seamless" else watermarkit_put_text
+        watermarked = watermark(image, args.text, size=args.size, spacing=args.spacing,
+                                strength=args.strength, font_path=args.font)
+
+        if args.show:
+            cv.imshow("Watermarked", watermarked)
+            cv.waitKey()
+        des = args.des or "watermarked.jpg"
+        cv.imwrite(des, watermarked)
+        print(f"saved to {des}")
